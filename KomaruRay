@@ -698,7 +698,7 @@ Rayfield.Enabled = false
 
 -- Get the player's PlayerGui
 local player = Players.LocalPlayer
-local playerGui = player:WaitForChild("PlayerGui"):FindFirstChildWhichIsA("ScreenGui")
+local playerGui = game.Players.LocalPlayer.PlayerGui:FindFirstChildWhichIsA("ScreenGui")
 
 if gethui then
     Rayfield.Parent = gethui()
