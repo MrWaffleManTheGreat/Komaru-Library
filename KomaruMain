@@ -29,6 +29,7 @@ local TrackedCharacters = {}
 -- Aimbot state
 local LockedTarget = nil
 local IsAiming = false
+local HasTargetLock = false -- Whether we have locked onto a specific target
 
 local Settings = {
     -- Combat (Aimbot)
@@ -50,14 +51,14 @@ local Settings = {
     BackWarning = false,
     
     -- Character type
-    ZombiesMode = false, -- Toggle between R6 and R15
+    ZombiesMode = false,
     
     -- Mouse aimbot
     AimKey = Enum.UserInputType.MouseButton2,
     TargetLock = true
 }
 
--- R15 body part names (modern Roblox characters)
+-- R15 body part names
 local R15Parts = {
     "Head",
     "UpperTorso",
@@ -76,7 +77,7 @@ local R15Parts = {
     "RightFoot"
 }
 
--- R6 body part names (old Roblox characters / zombies)
+-- R6 body part names
 local R6Parts = {
     "Head",
     "Torso", 
@@ -126,12 +127,9 @@ end
 local function isPlayerModel(model)
     if not model:IsA("Model") then return false end
     
-    -- Update parts list based on current mode
     updateActiveParts()
     
-    -- For R15 mode, we need fewer parts to be considered valid
     if not Settings.ZombiesMode then
-        -- R15: Check for core body parts
         local coreParts = {
             "Head",
             "UpperTorso",
@@ -145,7 +143,6 @@ local function isPlayerModel(model)
         end
         return true
     else
-        -- R6: Check for all classic parts
         for _, partName in ipairs(ActiveParts) do
             if not model:FindFirstChild(partName) then
                 return false
@@ -155,13 +152,10 @@ local function isPlayerModel(model)
     end
 end
 
--- Get current target part for aimbot (adjusts based on mode)
 local function getTargetPart(model)
     if not model then return nil end
     
-    -- Special handling for different modes
     if Settings.ZombiesMode then
-        -- R6 zombies: Use classic parts
         if Settings.AimbotPart == "Torso" then
             return model:FindFirstChild("Torso")
         elseif Settings.AimbotPart == "Head" then
@@ -170,7 +164,6 @@ local function getTargetPart(model)
             return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso")
         end
     else
-        -- R15: Map to R15 parts
         if Settings.AimbotPart == "Torso" then
             return model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
         elseif Settings.AimbotPart == "Head" then
@@ -232,6 +225,7 @@ local function updateTrackedCharacters()
             -- Clear lock if target was removed
             if LockedTarget and LockedTarget.Model == model then
                 LockedTarget = nil
+                HasTargetLock = false
             end
         end
     end
@@ -250,8 +244,8 @@ local function smoothMoveMouseTo(targetPos)
     end
 end
 
--- Find best target for aimbot
-local function findBestTarget()
+-- Find initial target when first pressing aimbot key
+local function findInitialTarget()
     if not Settings.AimbotEnabled then return nil end
     
     local mousePos = UserInputService:GetMouseLocation()
@@ -293,15 +287,8 @@ local function isLockedTargetValid()
     local targetPart = getTargetPart(LockedTarget.Model)
     if not targetPart then return false end
     
-    -- Check if target is still in FOV
-    local mousePos = UserInputService:GetMouseLocation()
-    local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
-    if not onScreen then return false end
-    
-    local screenPos = Vector2.new(partPos.X, partPos.Y)
-    local distance = (screenPos - mousePos).Magnitude
-    
-    return distance <= Settings.AimbotFOV
+    -- Target is still valid if the part exists (even if off screen)
+    return true
 end
 
 -- --- UI WINDOW ---
@@ -330,7 +317,6 @@ AimTab:CreateSlider({
    Callback = function(v) Settings.Smoothness = v end
 })
 
--- Update dropdown options based on mode
 local function updateAimbotOptions()
     if Settings.ZombiesMode then
         return {"Head", "Torso", "HumanoidRootPart"}
@@ -345,8 +331,8 @@ AimTab:CreateDropdown({
    CurrentOption = "Head",
    Callback = function(v) 
         Settings.AimbotPart = v 
-        -- Clear lock if target part changed
         LockedTarget = nil
+        HasTargetLock = false
    end
 })
 
@@ -357,31 +343,26 @@ AimTab:CreateToggle({
         Settings.TargetLock = v 
         if not v then
             LockedTarget = nil
+            HasTargetLock = false
         end
    end
 })
 
--- Zombies mode toggle (R6/R15 toggle)
+-- Zombies mode toggle
 AimTab:CreateToggle({
    Name = "Zombies Mode (R6 Characters)",
    CurrentValue = false,
    Callback = function(v) 
         Settings.ZombiesMode = v 
-        -- Update active parts
         updateActiveParts()
-        -- Clear tracked characters and rescan
         for model, data in pairs(TrackedCharacters) do
             if data.Box then data.Box:Remove() end
             if data.Line then data.Line:Remove() end
         end
         TrackedCharacters = {}
         LockedTarget = nil
-        -- Rescan with new settings
+        HasTargetLock = false
         updateTrackedCharacters()
-        
-        -- Update dropdown options
-        local newOptions = updateAimbotOptions()
-        -- Note: You might need to recreate the dropdown or update it if Rayfield supports it
    end
 })
 
@@ -461,13 +442,22 @@ RunService.RenderStepped:Connect(function()
     -- Check aim key state
     local currentAimKeyState = UserInputService:IsMouseButtonPressed(Settings.AimKey)
     
-    -- If key was released, clear lock
-    if lastAimKeyState and not currentAimKeyState then
+    -- Handle key press/release logic
+    if currentAimKeyState and not lastAimKeyState then
+        -- Key was just pressed - find initial target
+        IsAiming = true
+        if Settings.TargetLock then
+            LockedTarget = findInitialTarget()
+            HasTargetLock = (LockedTarget ~= nil)
+        end
+    elseif not currentAimKeyState and lastAimKeyState then
+        -- Key was just released - clear everything
+        IsAiming = false
         LockedTarget = nil
+        HasTargetLock = false
     end
     
     lastAimKeyState = currentAimKeyState
-    IsAiming = currentAimKeyState
     
     -- Update ESP for all tracked characters
     for model, data in pairs(TrackedCharacters) do
@@ -525,41 +515,52 @@ RunService.RenderStepped:Connect(function()
     
     -- Handle aimbot logic
     if Settings.AimbotEnabled and IsAiming then
-        -- Check if we need to acquire a new target
-        if not LockedTarget or not isLockedTargetValid() then
-            LockedTarget = findBestTarget()
-        end
-        
-        -- If we have a locked target, aim at it
-        if LockedTarget and LockedTarget.ScreenPosition then
-            -- Update target position (in case target moved)
-            local targetPart = getTargetPart(LockedTarget.Model)
-            if targetPart then
-                local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
-                if onScreen then
-                    LockedTarget.ScreenPosition = Vector2.new(partPos.X, partPos.Y)
-                    smoothMoveMouseTo(LockedTarget.ScreenPosition)
-                    
-                    -- Show lock indicator
-                    LockIndicator.Visible = true
-                    LockIndicator.Position = LockedTarget.ScreenPosition
+        if Settings.TargetLock and HasTargetLock and LockedTarget then
+            -- We have a locked target - stick to it
+            if isLockedTargetValid() then
+                local targetPart = getTargetPart(LockedTarget.Model)
+                if targetPart then
+                    local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                    if onScreen then
+                        LockedTarget.ScreenPosition = Vector2.new(partPos.X, partPos.Y)
+                        smoothMoveMouseTo(LockedTarget.ScreenPosition)
+                        
+                        -- Show lock indicator
+                        LockIndicator.Visible = true
+                        LockIndicator.Position = LockedTarget.ScreenPosition
+                    else
+                        -- Target went off screen but we keep lock (won't switch)
+                        LockIndicator.Visible = false
+                    end
                 else
-                    -- Target went off screen, clear lock
+                    -- Target lost its part, clear lock
                     LockedTarget = nil
+                    HasTargetLock = false
                     LockIndicator.Visible = false
                 end
             else
+                -- Target is no longer valid, clear lock
                 LockedTarget = nil
+                HasTargetLock = false
                 LockIndicator.Visible = false
             end
+        elseif Settings.TargetLock and not HasTargetLock then
+            -- No lock yet, find initial target
+            LockedTarget = findInitialTarget()
+            HasTargetLock = (LockedTarget ~= nil)
         else
-            LockIndicator.Visible = false
+            -- Target lock disabled - follow closest target
+            LockedTarget = findInitialTarget()
+            if LockedTarget and LockedTarget.ScreenPosition then
+                smoothMoveMouseTo(LockedTarget.ScreenPosition)
+                LockIndicator.Visible = true
+                LockIndicator.Position = LockedTarget.ScreenPosition
+            else
+                LockIndicator.Visible = false
+            end
         end
     else
-        -- Clear lock when not aiming
-        if not IsAiming then
-            LockedTarget = nil
-        end
+        -- Not aiming
         LockIndicator.Visible = false
     end
     
@@ -592,7 +593,7 @@ end)
 if EntitiesFolder then
     Rayfield:Notify({
         Title = "Komaru", 
-        Content = "Mouse Aimbot Loaded - R15 Mode Active", 
+        Content = "Mouse Aimbot Loaded - Target Lock Active", 
         Duration = 4
     })
 else
