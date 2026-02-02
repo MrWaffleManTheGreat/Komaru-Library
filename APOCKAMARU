@@ -1,0 +1,833 @@
+local Rayfield = loadstring(game:HttpGet('https://raw.githubusercontent.com/MrWaffleManTheGreat/Komaru-Library/refs/heads/main/KomaruRay'))()
+
+-- --- VARIABLEN & DATEN ---
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local Camera = workspace.CurrentCamera
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Character tracking system
+local TrackedCharacters = {}
+
+-- Aimbot state
+local LockedTarget = nil
+local IsAiming = false
+local HasTargetLock = false -- Whether we have locked onto a specific target
+
+-- Mouse movement tracking
+local lastMouseMove = tick()
+local mouseMovementCooldown = 0.016 -- ~60 FPS limit for mouse movements
+local mouseSmoothBuffer = {}
+
+local Settings = {
+    -- Combat (Aimbot)
+    AimbotEnabled = false,
+    Smoothness = 0.2,
+    AimbotPart = "Head",
+    AimbotFOV = 150,
+    ShowFOV = true,
+    FOVColor = Color3.fromRGB(255, 0, 0),
+    FOVThickness = 1,
+    
+    -- Visuals (ESP)
+    ESPEnabled = false,
+    ESPBoxes = false,
+    ESPTracer = false,
+    ESPDistance = false, -- NEW: Distance text toggle
+    ESPColor = Color3.fromRGB(255, 0, 0),
+    DistanceColor = Color3.fromRGB(255, 255, 255), -- NEW: Distance text color
+    
+    -- Warnings
+    BackWarning = false,
+    
+    -- Container toggles
+    TargetPlayers = true,
+    TargetZombies = true,
+    TargetCorpses = false,
+    
+    -- Mouse aimbot settings
+    AimKey = Enum.UserInputType.MouseButton2,
+    TargetLock = true,
+    
+    -- Third-person mouse settings
+    MaxMouseMovePerFrame = 20, -- Maximum pixels to move per frame
+    MouseAcceleration = 0.5, -- How quickly mouse accelerates
+    UseScreenCenterAsOrigin = false -- Try using screen center instead of current mouse
+}
+
+-- R15 body part names
+local R15Parts = {
+    "Head",
+    "UpperTorso",
+    "LowerTorso",
+    "LeftUpperArm",
+    "LeftLowerArm",
+    "LeftHand",
+    "RightUpperArm", 
+    "RightLowerArm",
+    "RightHand",
+    "LeftUpperLeg",
+    "LeftLowerLeg",
+    "LeftFoot",
+    "RightUpperLeg",
+    "RightLowerLeg",
+    "RightFoot"
+}
+
+-- R6 body part names
+local R6Parts = {
+    "Head",
+    "Torso", 
+    "Left Arm",
+    "Left Leg",
+    "Right Arm", 
+    "Right Leg"
+}
+
+-- Current active body parts list (always R15 for known containers)
+local ActiveParts = R15Parts
+
+-- --- DRAWING SETUP ---
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Filled = false
+FOVCircle.Transparency = 1
+FOVCircle.Visible = false
+FOVCircle.Thickness = 1
+
+-- Target lock indicator
+local LockIndicator = Drawing.new("Circle")
+LockIndicator.Filled = false
+LockIndicator.Transparency = 1
+LockIndicator.Visible = false
+LockIndicator.Radius = 8
+LockIndicator.Color = Color3.fromRGB(0, 255, 0)
+LockIndicator.Thickness = 3
+
+local WarningText = Drawing.new("Text")
+WarningText.Visible = false
+WarningText.Center = true
+WarningText.Size = 30
+WarningText.Outline = true
+WarningText.Font = 2
+WarningText.Color = Color3.new(1, 0, 0)
+WarningText.Text = "⚠️ ENEMY BEHIND YOU ⚠️"
+
+-- --- HELPER FUNCTIONS ---
+local function updateActiveParts()
+    ActiveParts = R15Parts
+end
+
+local function isPlayerModel(model)
+    if not model:IsA("Model") then return false end
+    
+    -- Check for HumanoidRootPart (primary requirement)
+    if not model:FindFirstChild("HumanoidRootPart") then
+        return false
+    end
+
+    if game.Players.LocalPlayer.Character == model then
+    return false
+    end
+    
+    -- Check for core R15 parts
+    local coreParts = {
+        "Head",
+        "UpperTorso",
+        "LowerTorso"
+    }
+    
+    for _, partName in ipairs(coreParts) do
+        if not model:FindFirstChild(partName) then
+            return false
+        end
+    end
+    return true
+end
+
+local function getTargetPart(model)
+    if not model then return nil end
+    
+    if Settings.AimbotPart == "Torso" then
+        return model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+    elseif Settings.AimbotPart == "Head" then
+        return model:FindFirstChild("Head")
+    elseif Settings.AimbotPart == "HumanoidRootPart" then
+        return model:FindFirstChild("HumanoidRootPart")
+    end
+    
+    return model:FindFirstChild(Settings.AimbotPart)
+end
+
+-- Check if model is in a targetable container
+local function isInTargetContainer(model)
+    if not model.Parent then return false end
+    
+    -- Check direct parent
+    local parent = model.Parent
+    if parent.Name == "Characters" and parent.Parent == workspace and Settings.TargetPlayers then
+        return true
+    elseif parent.Name == "Zombies" and parent.Parent == workspace and Settings.TargetZombies then
+        return true
+    elseif parent.Name == "Corpses" and parent.Parent == workspace and Settings.TargetCorpses then
+        return true
+    end
+    
+    -- Check if any parent is a target container
+    while parent ~= workspace and parent ~= nil do
+        if parent.Name == "Characters" and parent.Parent == workspace and Settings.TargetPlayers then
+            return true
+        elseif parent.Name == "Zombies" and parent.Parent == workspace and Settings.TargetZombies then
+            return true
+        elseif parent.Name == "Corpses" and parent.Parent == workspace and Settings.TargetCorpses then
+            return true
+        end
+        parent = parent.Parent
+    end
+    
+    return false
+end
+
+-- Get all entities from specified containers
+local function getEntitiesPlayers()
+    local results = {}
+    
+    -- Check Characters container
+    if Settings.TargetPlayers then
+        local charactersFolder = workspace:FindFirstChild("Characters")
+        if charactersFolder then
+            for _, model in ipairs(charactersFolder:GetChildren()) do
+                if isPlayerModel(model) then
+                    table.insert(results, model)
+                end
+            end
+        end
+    end
+    
+    -- Check Zombies container
+    if Settings.TargetZombies then
+        local zombiesFolder = workspace:FindFirstChild("Zombies")
+        if zombiesFolder then
+            for _, model in ipairs(zombiesFolder:GetChildren()) do
+                if isPlayerModel(model) then
+                    table.insert(results, model)
+                end
+            end
+        end
+    end
+    
+    -- Check Corpses container
+    if Settings.TargetCorpses then
+        local corpsesFolder = workspace:FindFirstChild("Corpses")
+        if corpsesFolder then
+            for _, model in ipairs(corpsesFolder:GetChildren()) do
+                if isPlayerModel(model) then
+                    table.insert(results, model)
+                end
+            end
+        end
+    end
+    
+    return results
+end
+
+-- Calculate distance between two points
+local function calculateDistance(position1, position2)
+    return (position1 - position2).Magnitude
+end
+
+-- Format distance for display
+local function formatDistance(distance)
+    return string.format("%.0f studs", distance)
+end
+
+-- Update tracked characters from containers
+local function updateTrackedCharacters()
+    local currentPlayers = getEntitiesPlayers()
+    local newTracked = {}
+    
+    -- Track current players
+    for _, model in ipairs(currentPlayers) do
+        if not TrackedCharacters[model] then
+            TrackedCharacters[model] = {
+                Model = model,
+                Name = model.Name,
+                Box = Drawing.new("Square"),
+                Line = Drawing.new("Line"),
+                DistanceText = Drawing.new("Text") -- NEW: Distance text drawing
+            }
+            
+            TrackedCharacters[model].Box.Visible = false
+            TrackedCharacters[model].Box.Thickness = 2
+            TrackedCharacters[model].Line.Visible = false
+            TrackedCharacters[model].Line.Thickness = 2
+            
+            -- NEW: Initialize distance text properties
+            TrackedCharacters[model].DistanceText.Visible = false
+            TrackedCharacters[model].DistanceText.Center = true
+            TrackedCharacters[model].DistanceText.Size = 14
+            TrackedCharacters[model].DistanceText.Outline = true
+            TrackedCharacters[model].DistanceText.Font = 2
+            TrackedCharacters[model].DistanceText.Color = Settings.DistanceColor
+        end
+        newTracked[model] = true
+    end
+    
+    -- Remove old tracked characters
+    for model, data in pairs(TrackedCharacters) do
+        if not newTracked[model] then
+            if data.Box then data.Box:Remove() end
+            if data.Line then data.Line:Remove() end
+            if data.DistanceText then data.DistanceText:Remove() end -- NEW: Remove distance text
+            TrackedCharacters[model] = nil
+            
+            -- Clear lock if target was removed
+            if LockedTarget and LockedTarget.Model == model then
+                LockedTarget = nil
+                HasTargetLock = false
+            end
+        end
+    end
+end
+
+-- Enhanced smooth mouse movement function for third-person
+local function smoothMoveMouseTo(targetPos)
+    if not targetPos then return end
+    
+    local currentMouse = UserInputService:GetMouseLocation()
+    
+    -- If using screen center as origin (helps with third-person)
+    if Settings.UseScreenCenterAsOrigin then
+        currentMouse = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    end
+    
+    local delta = targetPos - currentMouse
+    
+    -- Apply acceleration
+    local accelerationFactor = Settings.MouseAcceleration
+    local distance = delta.Magnitude
+    local acceleratedDelta = delta * (1 + (distance * accelerationFactor * 0.01))
+    
+    -- Apply smoothness
+    local smoothedDelta = acceleratedDelta * (1 - Settings.Smoothness)
+    
+    -- Limit maximum movement per frame to prevent camera jitter
+    local maxMove = Settings.MaxMouseMovePerFrame
+    if smoothedDelta.Magnitude > maxMove then
+        smoothedDelta = smoothedDelta.Unit * maxMove
+    end
+    
+    -- Only move if significant distance
+    if smoothedDelta.Magnitude > 0.5 then
+        -- Apply time-based cooldown to prevent overwhelming the system
+        local currentTime = tick()
+        if currentTime - lastMouseMove >= mouseMovementCooldown then
+            mousemoverel(smoothedDelta.X, smoothedDelta.Y)
+            lastMouseMove = currentTime
+        end
+    end
+end
+
+-- Find initial target when first pressing aimbot key
+local function findInitialTarget()
+    if not Settings.AimbotEnabled then return nil end
+    
+    local mousePos = UserInputService:GetMouseLocation()
+    
+    -- Optionally use screen center for third-person
+    if Settings.UseScreenCenterAsOrigin then
+        mousePos = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    end
+    
+    local bestTarget = nil
+    local closestDistance = Settings.AimbotFOV
+    
+    for model, data in pairs(TrackedCharacters) do
+        if model.Parent and isPlayerModel(model) and isInTargetContainer(model) then
+            local targetPart = getTargetPart(model)
+            if targetPart then
+                local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                if onScreen then
+                    local screenPos = Vector2.new(partPos.X, partPos.Y)
+                    local distance = (screenPos - mousePos).Magnitude
+                    
+                    if distance < closestDistance then
+                        bestTarget = {
+                            Model = model,
+                            Part = targetPart,
+                            ScreenPosition = screenPos,
+                            Distance = distance
+                        }
+                        closestDistance = distance
+                    end
+                end
+            end
+        end
+    end
+    
+    return bestTarget
+end
+
+-- Check if locked target is still valid
+local function isLockedTargetValid()
+    if not LockedTarget then return false end
+    if not LockedTarget.Model or not LockedTarget.Model.Parent then return false end
+    if not isPlayerModel(LockedTarget.Model) then return false end
+    if not isInTargetContainer(LockedTarget.Model) then return false end
+    
+    local targetPart = getTargetPart(LockedTarget.Model)
+    if not targetPart then return false end
+    
+    -- Target is still valid if the part exists (even if off screen)
+    return true
+end
+
+-- --- UI WINDOW ---
+local Window = Rayfield:CreateWindow({
+   Name = "KOMARU",
+   LoadingTitle = "KomaruCheat",
+   LoadingSubtitle = "Waffle-Chan and Aq9-san",
+   ConfigurationSaving = { Enabled = false }
+})
+
+local AimTab = Window:CreateTab("Combat (Aim)", 4483362458)
+local VisTab = Window:CreateTab("Visuals (ESP)", 4483345998)
+
+-- --- AIMBOT SEKTION ---
+AimTab:CreateSection("Aimbot Settings")
+
+AimTab:CreateToggle({
+   Name = "Aimbot",
+   CurrentValue = false,
+   Callback = function(v) Settings.AimbotEnabled = v end
+})
+
+AimTab:CreateSlider({
+   Name = "Smoothness / Strength",
+   Range = {0, 1}, Increment = 0.05, CurrentValue = 0.2,
+   Callback = function(v) Settings.Smoothness = v end
+})
+
+local function updateAimbotOptions()
+    return {"Head", "UpperTorso", "LowerTorso", "HumanoidRootPart"}
+end
+
+AimTab:CreateDropdown({
+   Name = "Target Bone",
+   Options = updateAimbotOptions(),
+   CurrentOption = "Head",
+   Callback = function(v) 
+        Settings.AimbotPart = v 
+        LockedTarget = nil
+        HasTargetLock = false
+   end
+})
+
+AimTab:CreateToggle({
+   Name = "Target Lock",
+   CurrentValue = true,
+   Callback = function(v) 
+        Settings.TargetLock = v 
+        if not v then
+            LockedTarget = nil
+            HasTargetLock = false
+        end
+   end
+})
+
+-- Third-person mouse settings
+AimTab:CreateSection("Third-Person Mouse Settings")
+
+AimTab:CreateToggle({
+   Name = "Use Screen Center as Origin",
+   CurrentValue = false,
+   Callback = function(v) 
+        Settings.UseScreenCenterAsOrigin = v 
+        if v then
+            Rayfield:Notify({
+                Title = "Info",
+                Content = "Aiming from screen center - Better for third-person",
+                Duration = 3
+            })
+        end
+   end
+})
+
+AimTab:CreateSlider({
+   Name = "Max Mouse Move Per Frame",
+   Range = {5, 500}, Increment = 1, CurrentValue = 20,
+   Callback = function(v) Settings.MaxMouseMovePerFrame = v end
+})
+
+AimTab:CreateSlider({
+   Name = "Mouse Acceleration",
+   Range = {0, 2}, Increment = 0.1, CurrentValue = 0.5,
+   Callback = function(v) Settings.MouseAcceleration = v end
+})
+
+-- Container target toggles
+AimTab:CreateSection("Target Selection")
+
+AimTab:CreateToggle({
+   Name = "Target Players (Characters)",
+   CurrentValue = true,
+   Callback = function(v) 
+        Settings.TargetPlayers = v 
+        -- Clear tracked characters when toggling
+        for model, data in pairs(TrackedCharacters) do
+            if data.Box then data.Box:Remove() end
+            if data.Line then data.Line:Remove() end
+            if data.DistanceText then data.DistanceText:Remove() end
+        end
+        TrackedCharacters = {}
+        LockedTarget = nil
+        HasTargetLock = false
+   end
+})
+
+AimTab:CreateToggle({
+   Name = "Target Zombies",
+   CurrentValue = true,
+   Callback = function(v) 
+        Settings.TargetZombies = v 
+        -- Clear tracked characters when toggling
+        for model, data in pairs(TrackedCharacters) do
+            if data.Box then data.Box:Remove() end
+            if data.Line then data.Line:Remove() end
+            if data.DistanceText then data.DistanceText:Remove() end
+        end
+        TrackedCharacters = {}
+        LockedTarget = nil
+        HasTargetLock = false
+   end
+})
+
+AimTab:CreateToggle({
+   Name = "Target Corpses",
+   CurrentValue = false,
+   Callback = function(v) 
+        Settings.TargetCorpses = v 
+        -- Clear tracked characters when toggling
+        for model, data in pairs(TrackedCharacters) do
+            if data.Box then data.Box:Remove() end
+            if data.Line then data.Line:Remove() end
+            if data.DistanceText then data.DistanceText:Remove() end
+        end
+        TrackedCharacters = {}
+        LockedTarget = nil
+        HasTargetLock = false
+   end
+})
+
+AimTab:CreateSection("FOV Customization")
+
+AimTab:CreateToggle({
+   Name = "Aimbot FOV ",
+   CurrentValue = true,
+   Callback = function(v) Settings.ShowFOV = v end
+})
+
+AimTab:CreateSlider({
+   Name = "FOV Radius",
+   Range = {50, 800}, Increment = 10, CurrentValue = 150,
+   Callback = function(v) Settings.AimbotFOV = v end
+})
+
+AimTab:CreateColorPicker({
+    Name = "FOV Color",
+    Color = Color3.fromRGB(255, 0, 0),
+    Callback = function(v) Settings.FOVColor = v end
+})
+
+AimTab:CreateColorPicker({
+    Name = "Lock Indicator Color",
+    Color = Color3.fromRGB(0, 255, 0),
+    Callback = function(v) LockIndicator.Color = v end
+})
+
+-- --- VISUALS SEKTION ---
+VisTab:CreateSection("ESP Options")
+
+VisTab:CreateToggle({
+   Name = " ESP ",
+   CurrentValue = false,
+   Callback = function(v) Settings.ESPEnabled = v end
+})
+
+VisTab:CreateToggle({
+   Name = " Boxes ",
+   CurrentValue = false,
+   Callback = function(v) Settings.ESPBoxes = v end
+})
+
+VisTab:CreateToggle({
+   Name = "Snaplines / Tracker",
+   CurrentValue = false,
+   Callback = function(v) Settings.ESPTracer = v end
+})
+
+-- NEW: Distance text toggle
+VisTab:CreateToggle({
+   Name = "Distance Text",
+   CurrentValue = false,
+   Callback = function(v) Settings.ESPDistance = v end
+})
+
+VisTab:CreateToggle({
+   Name = "Back-Warning (!)",
+   CurrentValue = false,
+   Callback = function(v) Settings.BackWarning = v end
+})
+
+VisTab:CreateColorPicker({
+    Name = "Visual Color",
+    Color = Color3.fromRGB(255, 0, 0),
+    Callback = function(v) Settings.ESPColor = v end
+})
+
+-- NEW: Distance text color picker
+VisTab:CreateColorPicker({
+    Name = "Distance Text Color",
+    Color = Color3.fromRGB(255, 255, 255),
+    Callback = function(v) 
+        Settings.DistanceColor = v 
+        -- Update existing distance texts
+        for model, data in pairs(TrackedCharacters) do
+            if data.DistanceText then
+                data.DistanceText.Color = v
+            end
+        end
+    end
+})
+
+-- Container ESP toggles
+VisTab:CreateSection("ESP Target Selection")
+
+VisTab:CreateToggle({
+   Name = "Show Player ESP (Characters)",
+   CurrentValue = true,
+   Callback = function(v) 
+        Settings.TargetPlayers = v 
+        -- Clear tracked characters when toggling
+        for model, data in pairs(TrackedCharacters) do
+            if data.Box then data.Box:Remove() end
+            if data.Line then data.Line:Remove() end
+            if data.DistanceText then data.DistanceText:Remove() end
+        end
+        TrackedCharacters = {}
+   end
+})
+
+VisTab:CreateToggle({
+   Name = "Show Zombie ESP",
+   CurrentValue = true,
+   Callback = function(v) 
+        Settings.TargetZombies = v 
+        -- Clear tracked characters when toggling
+        for model, data in pairs(TrackedCharacters) do
+            if data.Box then data.Box:Remove() end
+            if data.Line then data.Line:Remove() end
+            if data.DistanceText then data.DistanceText:Remove() end
+        end
+        TrackedCharacters = {}
+   end
+})
+
+VisTab:CreateToggle({
+   Name = "Show Corpse ESP",
+   CurrentValue = false,
+   Callback = function(v) 
+        Settings.TargetCorpses = v 
+        -- Clear tracked characters when toggling
+        for model, data in pairs(TrackedCharacters) do
+            if data.Box then data.Box:Remove() end
+            if data.Line then data.Line:Remove() end
+            if data.DistanceText then data.DistanceText:Remove() end
+        end
+        TrackedCharacters = {}
+   end
+})
+
+-- --- AIMBOT KEY STATE TRACKING ---
+local lastAimKeyState = false
+
+-- --- MAIN RENDER LOOP ---
+RunService.RenderStepped:Connect(function()
+    -- Update FOV circle
+    FOVCircle.Visible = Settings.ShowFOV
+    FOVCircle.Radius = Settings.AimbotFOV
+    FOVCircle.Position = UserInputService:GetMouseLocation()
+    FOVCircle.Color = Settings.FOVColor
+    
+    -- Update tracked characters from containers
+    updateTrackedCharacters()
+    
+    -- Check aim key state
+    local currentAimKeyState = UserInputService:IsMouseButtonPressed(Settings.AimKey)
+    
+    -- Handle key press/release logic
+    if currentAimKeyState and not lastAimKeyState then
+        -- Key was just pressed - find initial target
+        IsAiming = true
+        if Settings.TargetLock then
+            LockedTarget = findInitialTarget()
+            HasTargetLock = (LockedTarget ~= nil)
+        end
+    elseif not currentAimKeyState and lastAimKeyState then
+        -- Key was just released - clear everything
+        IsAiming = false
+        LockedTarget = nil
+        HasTargetLock = false
+    end
+    
+    lastAimKeyState = currentAimKeyState
+    
+    -- Update ESP for all tracked characters
+    for model, data in pairs(TrackedCharacters) do
+        if model.Parent and isPlayerModel(model) and isInTargetContainer(model) then
+            local torsoPart = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+            local head = model:FindFirstChild("Head")
+            
+            if torsoPart and head then
+                local torsoPos, onScreen = Camera:WorldToViewportPoint(torsoPart.Position)
+                
+                if onScreen then
+                    -- Box ESP
+                    if Settings.ESPEnabled and Settings.ESPBoxes then
+                        local headPos = Camera:WorldToViewportPoint(head.Position)
+                        local height = math.abs(headPos.Y - torsoPos.Y) * 2
+                        local width = height * 0.5
+                        
+                        data.Box.Visible = true
+                        data.Box.Size = Vector2.new(width, height)
+                        data.Box.Position = Vector2.new(torsoPos.X - width/2, torsoPos.Y - height/2)
+                        data.Box.Color = Settings.ESPColor
+                    else
+                        data.Box.Visible = false
+                    end
+                    
+                    -- Snaplines
+                    if Settings.ESPEnabled and Settings.ESPTracer then
+                        data.Line.Visible = true
+                        data.Line.From = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y)
+                        data.Line.To = Vector2.new(torsoPos.X, torsoPos.Y)
+                        data.Line.Color = Settings.ESPColor
+                    else
+                        data.Line.Visible = false
+                    end
+                    
+                    -- NEW: Distance Text
+                    if Settings.ESPEnabled and Settings.ESPDistance then
+                        -- Calculate distance from local player
+                        local localChar = LocalPlayer.Character
+                        if localChar and localChar:FindFirstChild("HumanoidRootPart") then
+                            local distance = calculateDistance(
+                                localChar.HumanoidRootPart.Position,
+                                torsoPart.Position
+                            )
+                            
+                            data.DistanceText.Visible = true
+                            data.DistanceText.Text = formatDistance(distance)
+                            data.DistanceText.Position = Vector2.new(torsoPos.X, torsoPos.Y + 35) -- Position under the torso
+                            data.DistanceText.Color = Settings.DistanceColor
+                        else
+                            data.DistanceText.Visible = false
+                        end
+                    else
+                        data.DistanceText.Visible = false
+                    end
+                else
+                    data.Box.Visible = false
+                    data.Line.Visible = false
+                    data.DistanceText.Visible = false
+                end
+            else
+                data.Box.Visible = false
+                data.Line.Visible = false
+                data.DistanceText.Visible = false
+            end
+        else
+            data.Box.Visible = false
+            data.Line.Visible = false
+            data.DistanceText.Visible = false
+        end
+    end
+    
+    -- Handle aimbot logic
+    if Settings.AimbotEnabled and IsAiming then
+        if Settings.TargetLock and HasTargetLock and LockedTarget then
+            -- We have a locked target - stick to it
+            if isLockedTargetValid() then
+                local targetPart = getTargetPart(LockedTarget.Model)
+                if targetPart then
+                    local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                    if onScreen then
+                        LockedTarget.ScreenPosition = Vector2.new(partPos.X, partPos.Y)
+                        smoothMoveMouseTo(LockedTarget.ScreenPosition)
+                        
+                        -- Show lock indicator
+                        LockIndicator.Visible = true
+                        LockIndicator.Position = LockedTarget.ScreenPosition
+                    else
+                        -- Target went off screen but we keep lock (won't switch)
+                        LockIndicator.Visible = false
+                    end
+                else
+                    -- Target lost its part, clear lock
+                    LockedTarget = nil
+                    HasTargetLock = false
+                    LockIndicator.Visible = false
+                end
+            else
+                -- Target is no longer valid, clear lock
+                LockedTarget = nil
+                HasTargetLock = false
+                LockIndicator.Visible = false
+            end
+        elseif Settings.TargetLock and not HasTargetLock then
+            -- No lock yet, find initial target
+            LockedTarget = findInitialTarget()
+            HasTargetLock = (LockedTarget ~= nil)
+        else
+            -- Target lock disabled - follow closest target
+            LockedTarget = findInitialTarget()
+            if LockedTarget and LockedTarget.ScreenPosition then
+                smoothMoveMouseTo(LockedTarget.ScreenPosition)
+                LockIndicator.Visible = true
+                LockIndicator.Position = LockedTarget.ScreenPosition
+            else
+                LockIndicator.Visible = false
+            end
+        end
+    else
+        -- Not aiming
+        LockIndicator.Visible = false
+    end
+    
+    -- Back warning
+    local showWarning = false
+    if Settings.BackWarning then
+        for model, data in pairs(TrackedCharacters) do
+            local torsoPart = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+            
+            if torsoPart then
+                local relPos = Camera.CFrame:PointToObjectSpace(torsoPart.Position)
+                if relPos.Z > 0 and (Camera.CFrame.Position - torsoPart.Position).Magnitude < 50 then
+                    showWarning = true
+                    break
+                end
+            end
+        end
+    end
+    
+    WarningText.Visible = showWarning
+    WarningText.Position = Vector2.new(Camera.ViewportSize.X / 2, 150)
+end)
+
+-- Initial notification
+Rayfield:Notify({
+    Title = "Komaru", 
+    Content = "Third-Person Mouse Aimbot Loaded - Use 'Screen Center as Origin' for better results", 
+    Duration = 4
+})
