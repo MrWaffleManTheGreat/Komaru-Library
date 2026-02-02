@@ -662,8 +662,7 @@ local RayfieldLibrary = {
 local UserInputService = getService("UserInputService")
 local TweenService = getService("TweenService")
 local Players = getService("Players")
-local CoreGui = game.Players.LocalPlayer.PlayerGui:FindFirstChildWhichIsA("ScreenGui")
-
+local CoreGui = getService("CoreGui").Drawing
 
 -- Interface Management
 
@@ -698,7 +697,7 @@ Rayfield.Enabled = false
 
 -- Get the player's PlayerGui
 local player = Players.LocalPlayer
-local playerGui = game.Players.LocalPlayer.PlayerGui:FindFirstChildWhichIsA("ScreenGui")
+local playerGui = player:WaitForChild("PlayerGui"):FindFirstChildWhichIsA("ScreenGui")
 
 if gethui then
     Rayfield.Parent = gethui()
@@ -1008,7 +1007,7 @@ local function SaveConfiguration()
 	if useStudio then
 		if script.Parent:FindFirstChild('configuration') then script.Parent.configuration:Destroy() end
 
-		local ScreenGui = Instance.new("Frame")
+		local ScreenGui = Instance.new("ScreenGui")
 		ScreenGui.Parent = script.Parent
 		ScreenGui.Name = 'configuration'
 
@@ -4005,4 +4004,3 @@ task.delay(4, function()
 end)
 
 return RayfieldLibrary
-
