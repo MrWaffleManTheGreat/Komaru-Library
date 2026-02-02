@@ -1,0 +1,604 @@
+local Rayfield = loadstring(game:HttpGet('https://raw.githubusercontent.com/MrWaffleManTheGreat/Komaru-Library/refs/heads/main/KomaruRay'))()
+
+-- --- VARIABLEN & DATEN ---
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Camera = workspace.CurrentCamera
+
+-- Find the Entities folder
+local EntitiesFolder = workspace:FindFirstChild("game_assets") and workspace.game_assets:FindFirstChild("Entities")
+
+if not EntitiesFolder then
+    -- Alternative: try to find Entities folder directly
+    EntitiesFolder = workspace:FindFirstChild("Entities")
+    
+    if not EntitiesFolder then
+        -- Search for any folder named "Entities"
+        for _, child in ipairs(workspace:GetChildren()) do
+            if child.Name == "Entities" and child:IsA("Folder") then
+                EntitiesFolder = child
+                break
+            end
+        end
+    end
+end
+
+-- Character tracking system
+local TrackedCharacters = {}
+
+-- Aimbot state
+local LockedTarget = nil
+local IsAiming = false
+
+local Settings = {
+    -- Combat (Aimbot)
+    AimbotEnabled = false,
+    Smoothness = 0.2,
+    AimbotPart = "Head",
+    AimbotFOV = 150,
+    ShowFOV = true,
+    FOVColor = Color3.fromRGB(255, 0, 0),
+    FOVThickness = 1,
+    
+    -- Visuals (ESP)
+    ESPEnabled = false,
+    ESPBoxes = false,
+    ESPTracer = false,
+    ESPColor = Color3.fromRGB(255, 0, 0),
+    
+    -- Warnings
+    BackWarning = false,
+    
+    -- Character type
+    ZombiesMode = false, -- Toggle between R6 and R15
+    
+    -- Mouse aimbot
+    AimKey = Enum.UserInputType.MouseButton2,
+    TargetLock = true
+}
+
+-- R15 body part names (modern Roblox characters)
+local R15Parts = {
+    "Head",
+    "UpperTorso",
+    "LowerTorso",
+    "LeftUpperArm",
+    "LeftLowerArm",
+    "LeftHand",
+    "RightUpperArm", 
+    "RightLowerArm",
+    "RightHand",
+    "LeftUpperLeg",
+    "LeftLowerLeg",
+    "LeftFoot",
+    "RightUpperLeg",
+    "RightLowerLeg",
+    "RightFoot"
+}
+
+-- R6 body part names (old Roblox characters / zombies)
+local R6Parts = {
+    "Head",
+    "Torso", 
+    "Left Arm",
+    "Left Leg",
+    "Right Arm", 
+    "Right Leg"
+}
+
+-- Current active body parts list
+local ActiveParts = R15Parts
+
+-- --- DRAWING SETUP ---
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Filled = false
+FOVCircle.Transparency = 1
+FOVCircle.Visible = false
+FOVCircle.Thickness = 1
+
+-- Target lock indicator
+local LockIndicator = Drawing.new("Circle")
+LockIndicator.Filled = false
+LockIndicator.Transparency = 1
+LockIndicator.Visible = false
+LockIndicator.Radius = 8
+LockIndicator.Color = Color3.fromRGB(0, 255, 0)
+LockIndicator.Thickness = 3
+
+local WarningText = Drawing.new("Text")
+WarningText.Visible = false
+WarningText.Center = true
+WarningText.Size = 30
+WarningText.Outline = true
+WarningText.Font = 2
+WarningText.Color = Color3.new(1, 0, 0)
+WarningText.Text = "⚠️ ENEMY BEHIND YOU ⚠️"
+
+-- --- HELPER FUNCTIONS ---
+local function updateActiveParts()
+    if Settings.ZombiesMode then
+        ActiveParts = R6Parts
+    else
+        ActiveParts = R15Parts
+    end
+end
+
+local function isPlayerModel(model)
+    if not model:IsA("Model") then return false end
+    
+    -- Update parts list based on current mode
+    updateActiveParts()
+    
+    -- For R15 mode, we need fewer parts to be considered valid
+    if not Settings.ZombiesMode then
+        -- R15: Check for core body parts
+        local coreParts = {
+            "Head",
+            "UpperTorso",
+            "LowerTorso"
+        }
+        
+        for _, partName in ipairs(coreParts) do
+            if not model:FindFirstChild(partName) then
+                return false
+            end
+        end
+        return true
+    else
+        -- R6: Check for all classic parts
+        for _, partName in ipairs(ActiveParts) do
+            if not model:FindFirstChild(partName) then
+                return false
+            end
+        end
+        return true
+    end
+end
+
+-- Get current target part for aimbot (adjusts based on mode)
+local function getTargetPart(model)
+    if not model then return nil end
+    
+    -- Special handling for different modes
+    if Settings.ZombiesMode then
+        -- R6 zombies: Use classic parts
+        if Settings.AimbotPart == "Torso" then
+            return model:FindFirstChild("Torso")
+        elseif Settings.AimbotPart == "Head" then
+            return model:FindFirstChild("Head")
+        elseif Settings.AimbotPart == "HumanoidRootPart" then
+            return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso")
+        end
+    else
+        -- R15: Map to R15 parts
+        if Settings.AimbotPart == "Torso" then
+            return model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+        elseif Settings.AimbotPart == "Head" then
+            return model:FindFirstChild("Head")
+        elseif Settings.AimbotPart == "HumanoidRootPart" then
+            return model:FindFirstChild("HumanoidRootPart")
+        end
+    end
+    
+    return model:FindFirstChild(Settings.AimbotPart)
+end
+
+-- Get all player models from Entities folder
+local function getEntitiesPlayers()
+    if not EntitiesFolder then return {} end
+    
+    local players = {}
+    for _, child in ipairs(EntitiesFolder:GetChildren()) do
+        if isPlayerModel(child) then
+            table.insert(players, child)
+        end
+    end
+    
+    return players
+end
+
+-- Update tracked characters directly from Entities folder
+local function updateTrackedCharacters()
+    if not EntitiesFolder then return end
+    
+    local currentPlayers = getEntitiesPlayers()
+    local newTracked = {}
+    
+    -- Track current players
+    for _, model in ipairs(currentPlayers) do
+        if not TrackedCharacters[model] then
+            TrackedCharacters[model] = {
+                Model = model,
+                Name = model.Name,
+                Box = Drawing.new("Square"),
+                Line = Drawing.new("Line")
+            }
+            
+            TrackedCharacters[model].Box.Visible = false
+            TrackedCharacters[model].Box.Thickness = 2
+            TrackedCharacters[model].Line.Visible = false
+            TrackedCharacters[model].Line.Thickness = 2
+        end
+        newTracked[model] = true
+    end
+    
+    -- Remove old tracked characters
+    for model, data in pairs(TrackedCharacters) do
+        if not newTracked[model] then
+            if data.Box then data.Box:Remove() end
+            if data.Line then data.Line:Remove() end
+            TrackedCharacters[model] = nil
+            
+            -- Clear lock if target was removed
+            if LockedTarget and LockedTarget.Model == model then
+                LockedTarget = nil
+            end
+        end
+    end
+end
+
+-- Smooth mouse movement function
+local function smoothMoveMouseTo(targetPos)
+    if not targetPos then return end
+    
+    local currentMouse = UserInputService:GetMouseLocation()
+    local delta = targetPos - currentMouse
+    local smoothedDelta = delta * (1 - Settings.Smoothness)
+    
+    if smoothedDelta.Magnitude > 0.5 then
+        mousemoverel(smoothedDelta.X, smoothedDelta.Y)
+    end
+end
+
+-- Find best target for aimbot
+local function findBestTarget()
+    if not Settings.AimbotEnabled then return nil end
+    
+    local mousePos = UserInputService:GetMouseLocation()
+    local bestTarget = nil
+    local closestDistance = Settings.AimbotFOV
+    
+    for model, data in pairs(TrackedCharacters) do
+        if model.Parent and isPlayerModel(model) then
+            local targetPart = getTargetPart(model)
+            if targetPart then
+                local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                if onScreen then
+                    local screenPos = Vector2.new(partPos.X, partPos.Y)
+                    local distance = (screenPos - mousePos).Magnitude
+                    
+                    if distance < closestDistance then
+                        bestTarget = {
+                            Model = model,
+                            Part = targetPart,
+                            ScreenPosition = screenPos,
+                            Distance = distance
+                        }
+                        closestDistance = distance
+                    end
+                end
+            end
+        end
+    end
+    
+    return bestTarget
+end
+
+-- Check if locked target is still valid
+local function isLockedTargetValid()
+    if not LockedTarget then return false end
+    if not LockedTarget.Model or not LockedTarget.Model.Parent then return false end
+    if not isPlayerModel(LockedTarget.Model) then return false end
+    
+    local targetPart = getTargetPart(LockedTarget.Model)
+    if not targetPart then return false end
+    
+    -- Check if target is still in FOV
+    local mousePos = UserInputService:GetMouseLocation()
+    local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+    if not onScreen then return false end
+    
+    local screenPos = Vector2.new(partPos.X, partPos.Y)
+    local distance = (screenPos - mousePos).Magnitude
+    
+    return distance <= Settings.AimbotFOV
+end
+
+-- --- UI WINDOW ---
+local Window = Rayfield:CreateWindow({
+   Name = "KOMARU",
+   LoadingTitle = "KomaruCheat",
+   LoadingSubtitle = "Waffle-Chan and Aq9-san",
+   ConfigurationSaving = { Enabled = false }
+})
+
+local AimTab = Window:CreateTab("Combat (Aim)", 4483362458)
+local VisTab = Window:CreateTab("Visuals (ESP)", 4483345998)
+
+-- --- AIMBOT SEKTION ---
+AimTab:CreateSection("Aimbot Settings")
+
+AimTab:CreateToggle({
+   Name = "Aimbot",
+   CurrentValue = false,
+   Callback = function(v) Settings.AimbotEnabled = v end
+})
+
+AimTab:CreateSlider({
+   Name = "Smoothness / Strength",
+   Range = {0, 1}, Increment = 0.05, CurrentValue = 0.2,
+   Callback = function(v) Settings.Smoothness = v end
+})
+
+-- Update dropdown options based on mode
+local function updateAimbotOptions()
+    if Settings.ZombiesMode then
+        return {"Head", "Torso", "HumanoidRootPart"}
+    else
+        return {"Head", "UpperTorso", "LowerTorso", "HumanoidRootPart"}
+    end
+end
+
+AimTab:CreateDropdown({
+   Name = "Target Bone",
+   Options = updateAimbotOptions(),
+   CurrentOption = "Head",
+   Callback = function(v) 
+        Settings.AimbotPart = v 
+        -- Clear lock if target part changed
+        LockedTarget = nil
+   end
+})
+
+AimTab:CreateToggle({
+   Name = "Target Lock",
+   CurrentValue = true,
+   Callback = function(v) 
+        Settings.TargetLock = v 
+        if not v then
+            LockedTarget = nil
+        end
+   end
+})
+
+-- Zombies mode toggle (R6/R15 toggle)
+AimTab:CreateToggle({
+   Name = "Zombies Mode (R6 Characters)",
+   CurrentValue = false,
+   Callback = function(v) 
+        Settings.ZombiesMode = v 
+        -- Update active parts
+        updateActiveParts()
+        -- Clear tracked characters and rescan
+        for model, data in pairs(TrackedCharacters) do
+            if data.Box then data.Box:Remove() end
+            if data.Line then data.Line:Remove() end
+        end
+        TrackedCharacters = {}
+        LockedTarget = nil
+        -- Rescan with new settings
+        updateTrackedCharacters()
+        
+        -- Update dropdown options
+        local newOptions = updateAimbotOptions()
+        -- Note: You might need to recreate the dropdown or update it if Rayfield supports it
+   end
+})
+
+AimTab:CreateSection("FOV Customization")
+
+AimTab:CreateToggle({
+   Name = "Aimbot FOV ",
+   CurrentValue = true,
+   Callback = function(v) Settings.ShowFOV = v end
+})
+
+AimTab:CreateSlider({
+   Name = "FOV Radius",
+   Range = {50, 800}, Increment = 10, CurrentValue = 150,
+   Callback = function(v) Settings.AimbotFOV = v end
+})
+
+AimTab:CreateColorPicker({
+    Name = "FOV Color",
+    Color = Color3.fromRGB(255, 0, 0),
+    Callback = function(v) Settings.FOVColor = v end
+})
+
+AimTab:CreateColorPicker({
+    Name = "Lock Indicator Color",
+    Color = Color3.fromRGB(0, 255, 0),
+    Callback = function(v) LockIndicator.Color = v end
+})
+
+-- --- VISUALS SEKTION ---
+VisTab:CreateSection("ESP Options")
+
+VisTab:CreateToggle({
+   Name = " ESP ",
+   CurrentValue = false,
+   Callback = function(v) Settings.ESPEnabled = v end
+})
+
+VisTab:CreateToggle({
+   Name = " Boxes ",
+   CurrentValue = false,
+   Callback = function(v) Settings.ESPBoxes = v end
+})
+
+VisTab:CreateToggle({
+   Name = "Snaplines / Tracker",
+   CurrentValue = false,
+   Callback = function(v) Settings.ESPTracer = v end
+})
+
+VisTab:CreateToggle({
+   Name = "Back-Warning (!)",
+   CurrentValue = false,
+   Callback = function(v) Settings.BackWarning = v end
+})
+
+VisTab:CreateColorPicker({
+    Name = "Visual Color",
+    Color = Color3.fromRGB(255, 0, 0),
+    Callback = function(v) Settings.ESPColor = v end
+})
+
+-- --- AIMBOT KEY STATE TRACKING ---
+local lastAimKeyState = false
+
+-- --- MAIN RENDER LOOP ---
+RunService.RenderStepped:Connect(function()
+    -- Update FOV circle
+    FOVCircle.Visible = Settings.ShowFOV
+    FOVCircle.Radius = Settings.AimbotFOV
+    FOVCircle.Position = UserInputService:GetMouseLocation()
+    FOVCircle.Color = Settings.FOVColor
+    
+    -- Update tracked characters directly from Entities folder
+    updateTrackedCharacters()
+    
+    -- Check aim key state
+    local currentAimKeyState = UserInputService:IsMouseButtonPressed(Settings.AimKey)
+    
+    -- If key was released, clear lock
+    if lastAimKeyState and not currentAimKeyState then
+        LockedTarget = nil
+    end
+    
+    lastAimKeyState = currentAimKeyState
+    IsAiming = currentAimKeyState
+    
+    -- Update ESP for all tracked characters
+    for model, data in pairs(TrackedCharacters) do
+        if model.Parent and isPlayerModel(model) then
+            local torsoPart = nil
+            
+            if Settings.ZombiesMode then
+                torsoPart = model:FindFirstChild("Torso")
+            else
+                torsoPart = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+            end
+            
+            local head = model:FindFirstChild("Head")
+            
+            if torsoPart and head then
+                local torsoPos, onScreen = Camera:WorldToViewportPoint(torsoPart.Position)
+                
+                if onScreen then
+                    -- Box ESP
+                    if Settings.ESPEnabled and Settings.ESPBoxes then
+                        local headPos = Camera:WorldToViewportPoint(head.Position)
+                        local height = math.abs(headPos.Y - torsoPos.Y) * 2
+                        local width = height * 0.5
+                        
+                        data.Box.Visible = true
+                        data.Box.Size = Vector2.new(width, height)
+                        data.Box.Position = Vector2.new(torsoPos.X - width/2, torsoPos.Y - height/2)
+                        data.Box.Color = Settings.ESPColor
+                    else
+                        data.Box.Visible = false
+                    end
+                    
+                    -- Snaplines
+                    if Settings.ESPEnabled and Settings.ESPTracer then
+                        data.Line.Visible = true
+                        data.Line.From = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y)
+                        data.Line.To = Vector2.new(torsoPos.X, torsoPos.Y)
+                        data.Line.Color = Settings.ESPColor
+                    else
+                        data.Line.Visible = false
+                    end
+                else
+                    data.Box.Visible = false
+                    data.Line.Visible = false
+                end
+            else
+                data.Box.Visible = false
+                data.Line.Visible = false
+            end
+        else
+            data.Box.Visible = false
+            data.Line.Visible = false
+        end
+    end
+    
+    -- Handle aimbot logic
+    if Settings.AimbotEnabled and IsAiming then
+        -- Check if we need to acquire a new target
+        if not LockedTarget or not isLockedTargetValid() then
+            LockedTarget = findBestTarget()
+        end
+        
+        -- If we have a locked target, aim at it
+        if LockedTarget and LockedTarget.ScreenPosition then
+            -- Update target position (in case target moved)
+            local targetPart = getTargetPart(LockedTarget.Model)
+            if targetPart then
+                local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                if onScreen then
+                    LockedTarget.ScreenPosition = Vector2.new(partPos.X, partPos.Y)
+                    smoothMoveMouseTo(LockedTarget.ScreenPosition)
+                    
+                    -- Show lock indicator
+                    LockIndicator.Visible = true
+                    LockIndicator.Position = LockedTarget.ScreenPosition
+                else
+                    -- Target went off screen, clear lock
+                    LockedTarget = nil
+                    LockIndicator.Visible = false
+                end
+            else
+                LockedTarget = nil
+                LockIndicator.Visible = false
+            end
+        else
+            LockIndicator.Visible = false
+        end
+    else
+        -- Clear lock when not aiming
+        if not IsAiming then
+            LockedTarget = nil
+        end
+        LockIndicator.Visible = false
+    end
+    
+    -- Back warning
+    local showWarning = false
+    if Settings.BackWarning then
+        for model, data in pairs(TrackedCharacters) do
+            local torsoPart = nil
+            if Settings.ZombiesMode then
+                torsoPart = model:FindFirstChild("Torso")
+            else
+                torsoPart = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+            end
+            
+            if torsoPart then
+                local relPos = Camera.CFrame:PointToObjectSpace(torsoPart.Position)
+                if relPos.Z > 0 and (Camera.CFrame.Position - torsoPart.Position).Magnitude < 50 then
+                    showWarning = true
+                    break
+                end
+            end
+        end
+    end
+    
+    WarningText.Visible = showWarning
+    WarningText.Position = Vector2.new(Camera.ViewportSize.X / 2, 150)
+end)
+
+-- Initial notification
+if EntitiesFolder then
+    Rayfield:Notify({
+        Title = "Komaru", 
+        Content = "Mouse Aimbot Loaded - R15 Mode Active", 
+        Duration = 4
+    })
+else
+    Rayfield:Notify({
+        Title = "Komaru", 
+        Content = "Mouse Aimbot Loaded - No Entities folder found", 
+        Duration = 6
+    })
+end
