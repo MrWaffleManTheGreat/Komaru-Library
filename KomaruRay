@@ -662,7 +662,8 @@ local RayfieldLibrary = {
 local UserInputService = getService("UserInputService")
 local TweenService = getService("TweenService")
 local Players = getService("Players")
-local CoreGui = getService("CoreGui")
+local CoreGui = player:WaitForChild("PlayerGui"):FindFirstChildWhichIsA("ScreenGui")
+
 
 -- Interface Management
 
@@ -1007,7 +1008,7 @@ local function SaveConfiguration()
 	if useStudio then
 		if script.Parent:FindFirstChild('configuration') then script.Parent.configuration:Destroy() end
 
-		local ScreenGui = Instance.new("ScreenGui")
+		local ScreenGui = Instance.new("Frame")
 		ScreenGui.Parent = script.Parent
 		ScreenGui.Name = 'configuration'
 
