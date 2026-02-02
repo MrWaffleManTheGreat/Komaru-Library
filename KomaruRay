@@ -662,7 +662,7 @@ local RayfieldLibrary = {
 local UserInputService = getService("UserInputService")
 local TweenService = getService("TweenService")
 local Players = getService("Players")
-local CoreGui = player:WaitForChild("PlayerGui"):FindFirstChildWhichIsA("ScreenGui")
+local CoreGui = game.Players.LocalPlayer.PlayerGui:FindFirstChildWhichIsA("ScreenGui")
 
 
 -- Interface Management
