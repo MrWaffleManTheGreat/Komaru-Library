@@ -16,10 +16,14 @@ local LockedTarget = nil
 local IsAiming = false
 local HasTargetLock = false -- Whether we have locked onto a specific target
 
+-- Triggerbot state
+local IsTriggerbotActive = false
+local lastTriggerTime = 0
+local triggerCooldown = 0.1 -- Minimum time between triggerbot shots (seconds)
+
 -- Mouse movement tracking
 local lastMouseMove = tick()
 local mouseMovementCooldown = 0.016 -- ~60 FPS limit for mouse movements
-local mouseSmoothBuffer = {}
 
 local Settings = {
     -- Combat (Aimbot)
@@ -31,13 +35,21 @@ local Settings = {
     FOVColor = Color3.fromRGB(255, 0, 0),
     FOVThickness = 1,
     
+    -- Triggerbot
+    TriggerbotEnabled = false,
+    TriggerbotKey = Enum.KeyCode.T, -- Default triggerbot key (T key)
+    TriggerbotDelay = 0.1, -- Delay between shots (seconds)
+    TriggerbotRange = 1000, -- Maximum range for triggerbot (studs)
+    TriggerbotFOV = 100, -- Higher default FOV for triggerbot targeting
+    TriggerbotRaycast = true, -- Enable raycast check for line of sight
+    
     -- Visuals (ESP)
     ESPEnabled = false,
     ESPBoxes = false,
     ESPTracer = false,
-    ESPDistance = false, -- NEW: Distance text toggle
+    ESPDistance = false, -- Distance text toggle
     ESPColor = Color3.fromRGB(255, 0, 0),
-    DistanceColor = Color3.fromRGB(255, 255, 255), -- NEW: Distance text color
+    DistanceColor = Color3.fromRGB(255, 255, 255), -- Distance text color
     
     -- Warnings
     BackWarning = false,
@@ -105,6 +117,15 @@ LockIndicator.Radius = 8
 LockIndicator.Color = Color3.fromRGB(0, 255, 0)
 LockIndicator.Thickness = 3
 
+-- Triggerbot indicator
+local TriggerbotIndicator = Drawing.new("Circle")
+TriggerbotIndicator.Filled = false
+TriggerbotIndicator.Transparency = 1
+TriggerbotIndicator.Visible = false
+TriggerbotIndicator.Radius = 6
+TriggerbotIndicator.Color = Color3.fromRGB(0, 0, 255) -- Blue for triggerbot
+TriggerbotIndicator.Thickness = 2
+
 local WarningText = Drawing.new("Text")
 WarningText.Visible = false
 WarningText.Center = true
@@ -120,7 +141,7 @@ local function updateActiveParts()
 end
 
 local function isPlayerModel(model)
-    if not model:IsA("Model") then return false end
+    if not model or not model:IsA("Model") then return false end
     
     -- Check for HumanoidRootPart (primary requirement)
     if not model:FindFirstChild("HumanoidRootPart") then
@@ -162,7 +183,7 @@ end
 
 -- Check if model is in a targetable container
 local function isInTargetContainer(model)
-    if not model.Parent then return false end
+    if not model or not model.Parent then return false end
     
     -- Check direct parent
     local parent = model.Parent
@@ -234,6 +255,7 @@ end
 
 -- Calculate distance between two points
 local function calculateDistance(position1, position2)
+    if not position1 or not position2 then return 9999 end
     return (position1 - position2).Magnitude
 end
 
@@ -255,7 +277,7 @@ local function updateTrackedCharacters()
                 Name = model.Name,
                 Box = Drawing.new("Square"),
                 Line = Drawing.new("Line"),
-                DistanceText = Drawing.new("Text") -- NEW: Distance text drawing
+                DistanceText = Drawing.new("Text") -- Distance text drawing
             }
             
             TrackedCharacters[model].Box.Visible = false
@@ -263,7 +285,7 @@ local function updateTrackedCharacters()
             TrackedCharacters[model].Line.Visible = false
             TrackedCharacters[model].Line.Thickness = 2
             
-            -- NEW: Initialize distance text properties
+            -- Initialize distance text properties
             TrackedCharacters[model].DistanceText.Visible = false
             TrackedCharacters[model].DistanceText.Center = true
             TrackedCharacters[model].DistanceText.Size = 14
@@ -279,7 +301,7 @@ local function updateTrackedCharacters()
         if not newTracked[model] then
             if data.Box then data.Box:Remove() end
             if data.Line then data.Line:Remove() end
-            if data.DistanceText then data.DistanceText:Remove() end -- NEW: Remove distance text
+            if data.DistanceText then data.DistanceText:Remove() end
             TrackedCharacters[model] = nil
             
             -- Clear lock if target was removed
@@ -344,7 +366,7 @@ local function findInitialTarget()
     local closestDistance = Settings.AimbotFOV
     
     for model, data in pairs(TrackedCharacters) do
-        if model.Parent and isPlayerModel(model) and isInTargetContainer(model) then
+        if model and model.Parent and isPlayerModel(model) and isInTargetContainer(model) then
             local targetPart = getTargetPart(model)
             if targetPart then
                 local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
@@ -383,6 +405,199 @@ local function isLockedTargetValid()
     return true
 end
 
+-- RAYCAST FUNCTIONS - FIXED TO ONLY IGNORE LOCAL PLAYER
+local function raycastCheck(origin, targetPart)
+    if not origin or not targetPart then return false end
+    
+    -- Create ray from origin to target part
+    local direction = (targetPart.Position - origin).Unit
+    local raycastParams = RaycastParams.new()
+    
+    -- Set up raycast parameters
+    raycastParams.FilterType = Enum.RaycastFilterType.Blacklist
+    raycastParams.IgnoreWater = true
+    
+    -- Create filter list
+    local filterList = {}
+    
+    -- 1. Always ignore local player's character
+    if LocalPlayer.Character then
+        for _, part in ipairs(LocalPlayer.Character:GetDescendants()) do
+            if part:IsA("BasePart") then
+                table.insert(filterList, part)
+            end
+        end
+    end
+    
+    -- 2. Ignore everything in targetPart's parent EXCEPT the target part itself
+    if targetPart.Parent then
+        for _, child in ipairs(targetPart.Parent:GetDescendants()) do
+            -- Only add to filter if it's a BasePart AND it's NOT the target part
+            if child:IsA("BasePart") and child ~= targetPart then
+                table.insert(filterList, child)
+            end
+        end
+    end
+    
+    raycastParams.FilterDescendantsInstances = filterList
+    
+    -- Perform raycast
+    local raycastResult = workspace:Raycast(origin, direction * Settings.TriggerbotRange, raycastParams)
+    
+    if raycastResult then
+        local hitPart = raycastResult.Instance
+        local hitModel = hitPart:FindFirstAncestorWhichIsA("Model")
+        local targetModel = targetPart.Parent
+        
+        -- Check if we hit ANY part of the target model
+        if hitModel == targetModel then
+            -- We hit the target model, now check if it's the specific part we're aiming for
+            -- Get the selected body part name
+            local selectedPartName = Settings.AimbotPart
+            
+            -- Handle special cases
+            if selectedPartName == "Torso" then
+                -- For torso, accept either UpperTorso or Torso
+                if hitPart.Name == "UpperTorso" or hitPart.Name == "Torso" then
+                    return true -- Hit the torso
+                elseif hitPart.Name == "Head" or hitPart.Name == "HumanoidRootPart" then
+                    -- Check distance to see if we're close enough to the selected part
+                    local distanceToSelected = (hitPart.Position - targetPart.Position).Magnitude
+                    if distanceToSelected < 2 then -- Within 2 studs
+                        return true
+                    end
+                end
+            elseif selectedPartName == "HumanoidRootPart" then
+                -- For HumanoidRootPart, accept it or check if very close
+                if hitPart.Name == "HumanoidRootPart" then
+                    return true -- Hit the HumanoidRootPart
+                else
+                    -- Check if we hit near the HumanoidRootPart
+                    local rootPart = targetModel:FindFirstChild("HumanoidRootPart")
+                    if rootPart then
+                        local distanceToRoot = (hitPart.Position - rootPart.Position).Magnitude
+                        if distanceToRoot < 2 then -- Within 2 studs
+                            return true
+                        end
+                    end
+                end
+            else
+                -- For specific body parts (Head, arms, legs, etc.)
+                if hitPart.Name == selectedPartName then
+                    return true -- Hit the exact part we're aiming for
+                else
+                    -- Check if we hit something close to the target part
+                    local distanceToTarget = (hitPart.Position - targetPart.Position).Magnitude
+                    if distanceToTarget < 1.5 then -- Within 1.5 studs
+                        return true
+                    end
+                end
+            end
+            
+            -- If we hit the target model but not the specific part, don't shoot
+            return false
+        else
+            -- We hit something else (wall, obstacle, different player, etc.)
+            return false
+        end
+    else
+        -- Nothing was hit, but we need the target to be in the ray path
+        -- Calculate if the target would be in the ray's path
+        local targetPos = targetPart.Position
+        local rayDirection = direction * Settings.TriggerbotRange
+        local rayEnd = origin + rayDirection
+        
+        -- Check if target position is close to the ray line
+        local closestPoint = origin + ((targetPos - origin):Dot(direction)) * direction
+        local distanceToRay = (targetPos - closestPoint).Magnitude
+        
+        -- If target is very close to the ray line (within 0.5 studs), consider it a hit
+        if distanceToRay < 0.5 then
+            return true
+        else
+            return false
+        end
+    end
+end
+
+-- TRIGGERBOT FUNCTIONS
+local function findTriggerbotTarget()
+    if not Settings.TriggerbotEnabled then return nil end
+    
+    local mousePos = UserInputService:GetMouseLocation()
+    local bestTarget = nil
+    local closestDistance = Settings.TriggerbotFOV
+    
+    for model, data in pairs(TrackedCharacters) do
+        if model and model.Parent and isPlayerModel(model) and isInTargetContainer(model) then
+            local targetPart = getTargetPart(model)
+            if targetPart then
+                -- Check if target is within range
+                local localChar = LocalPlayer.Character
+                if localChar and localChar:FindFirstChild("HumanoidRootPart") then
+                    local distance = calculateDistance(
+                        localChar.HumanoidRootPart.Position,
+                        targetPart.Position
+                    )
+                    
+                    if distance <= Settings.TriggerbotRange then
+                        local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                        if onScreen then
+                            local screenPos = Vector2.new(partPos.X, partPos.Y)
+                            local screenDistance = (screenPos - mousePos).Magnitude
+                            
+                            if screenDistance < closestDistance then
+                                -- Check line of sight if raycast is enabled
+                                if Settings.TriggerbotRaycast then
+                                    local cameraPos = Camera.CFrame.Position
+                                    local hasLineOfSight = raycastCheck(cameraPos, targetPart)
+                                    
+                                    if hasLineOfSight then
+                                        bestTarget = {
+                                            Model = model,
+                                            Part = targetPart,
+                                            ScreenPosition = screenPos,
+                                            Distance = distance,
+                                            ScreenDistance = screenDistance,
+                                            HasLineOfSight = true
+                                        }
+                                        closestDistance = screenDistance
+                                    else
+                                        -- Store target but mark as blocked
+                                        bestTarget = {
+                                            Model = model,
+                                            Part = targetPart,
+                                            ScreenPosition = screenPos,
+                                            Distance = distance,
+                                            ScreenDistance = screenDistance,
+                                            HasLineOfSight = false
+                                        }
+                                        closestDistance = screenDistance
+                                    end
+                                else
+                                    -- No raycast check needed
+                                    bestTarget = {
+                                        Model = model,
+                                        Part = targetPart,
+                                        ScreenPosition = screenPos,
+                                        Distance = distance,
+                                        ScreenDistance = screenDistance,
+                                        HasLineOfSight = true
+                                    }
+                                    closestDistance = screenDistance
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    return bestTarget
+end
+
+
 -- --- UI WINDOW ---
 local Window = Rayfield:CreateWindow({
    Name = "KOMARU",
@@ -393,6 +608,104 @@ local Window = Rayfield:CreateWindow({
 
 local AimTab = Window:CreateTab("Combat (Aim)", 4483362458)
 local VisTab = Window:CreateTab("Visuals (ESP)", 4483345998)
+
+-- --- TRIGGERBOT SEKTION ---
+AimTab:CreateSection("Triggerbot Settings")
+
+AimTab:CreateToggle({
+   Name = "Triggerbot",
+   CurrentValue = false,
+   Callback = function(v) 
+        Settings.TriggerbotEnabled = v 
+        TriggerbotIndicator.Visible = false
+        IsTriggerbotActive = false
+   end
+})
+
+AimTab:CreateToggle({
+   Name = "Raycast Check (Line of Sight)",
+   CurrentValue = true,
+   Callback = function(v) 
+        Settings.TriggerbotRaycast = v
+        Rayfield:Notify({
+            Title = "Triggerbot",
+            Content = v and "Raycast enabled: Will only shoot with clear line of sight to target body part" or "Raycast disabled: Will shoot through walls",
+            Duration = 3
+        })
+   end
+})
+
+-- Create keybind for triggerbot
+local triggerKeybind = AimTab:CreateKeybind({
+   Name = "Triggerbot Key",
+   CurrentKeybind = "T",
+   HoldToInteract = false,
+   Callback = function(key)
+        -- Convert string key to Enum.KeyCode
+        local keyCode
+        if key == "LeftControl" or key == "RightControl" then
+            keyCode = Enum.KeyCode.LeftControl
+        elseif key == "LeftShift" or key == "RightShift" then
+            keyCode = Enum.KeyCode.LeftShift
+        elseif key == "LeftAlt" or key == "RightAlt" then
+            keyCode = Enum.KeyCode.LeftAlt
+        elseif key == "MouseButton1" then
+            keyCode = Enum.UserInputType.MouseButton1
+        elseif key == "MouseButton2" then
+            keyCode = Enum.UserInputType.MouseButton2
+        else
+            -- Try to get the key code from string
+            for _, enumKey in pairs(Enum.KeyCode:GetEnumItems()) do
+                if tostring(enumKey) == key then
+                    keyCode = enumKey
+                    break
+                end
+            end
+        end
+        
+        if keyCode then
+            Settings.TriggerbotKey = keyCode
+            Rayfield:Notify({
+                Title = "Triggerbot",
+                Content = "Triggerbot key set to: " .. key,
+                Duration = 2
+            })
+        end
+   end,
+})
+
+AimTab:CreateSlider({
+   Name = "Triggerbot Delay",
+   Range = {0, 1},
+   Increment = 0.01,
+   CurrentValue = 0.1,
+   Callback = function(v) 
+        Settings.TriggerbotDelay = v 
+        triggerCooldown = v -- Update cooldown
+   end
+})
+
+AimTab:CreateSlider({
+   Name = "Triggerbot Range",
+   Range = {50, 5000},
+   Increment = 10,
+   CurrentValue = 1000,
+   Callback = function(v) Settings.TriggerbotRange = v end
+})
+
+AimTab:CreateSlider({
+   Name = "Triggerbot FOV",
+   Range = {10, 50}, -- Increased max FOV
+   Increment = 5,
+   CurrentValue = 10, -- Higher default (100 instead of 50)
+   Callback = function(v) Settings.TriggerbotFOV = v end
+})
+
+AimTab:CreateColorPicker({
+    Name = "Triggerbot Indicator Color",
+    Color = Color3.fromRGB(0, 0, 255),
+    Callback = function(v) TriggerbotIndicator.Color = v end
+})
 
 -- --- AIMBOT SEKTION ---
 AimTab:CreateSection("Aimbot Settings")
@@ -567,7 +880,6 @@ VisTab:CreateToggle({
    Callback = function(v) Settings.ESPTracer = v end
 })
 
--- NEW: Distance text toggle
 VisTab:CreateToggle({
    Name = "Distance Text",
    CurrentValue = false,
@@ -586,7 +898,6 @@ VisTab:CreateColorPicker({
     Callback = function(v) Settings.ESPColor = v end
 })
 
--- NEW: Distance text color picker
 VisTab:CreateColorPicker({
     Name = "Distance Text Color",
     Color = Color3.fromRGB(255, 255, 255),
@@ -651,9 +962,30 @@ VisTab:CreateToggle({
 
 -- --- AIMBOT KEY STATE TRACKING ---
 local lastAimKeyState = false
+local lastTriggerKeyState = false
+
+-- Input handling for triggerbot key
+UserInputService.InputBegan:Connect(function(input)
+    if Settings.TriggerbotEnabled then
+        if input.KeyCode == Settings.TriggerbotKey then
+            IsTriggerbotActive = true
+        end
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if Settings.TriggerbotEnabled then
+        if input.KeyCode == Settings.TriggerbotKey then
+            IsTriggerbotActive = false
+            TriggerbotIndicator.Visible = false
+        end
+    end
+end)
 
 -- --- MAIN RENDER LOOP ---
 RunService.RenderStepped:Connect(function()
+    local currentTime = tick()
+    
     -- Update FOV circle
     FOVCircle.Visible = Settings.ShowFOV
     FOVCircle.Radius = Settings.AimbotFOV
@@ -666,7 +998,7 @@ RunService.RenderStepped:Connect(function()
     -- Check aim key state
     local currentAimKeyState = UserInputService:IsMouseButtonPressed(Settings.AimKey)
     
-    -- Handle key press/release logic
+    -- Handle aim key press/release logic
     if currentAimKeyState and not lastAimKeyState then
         -- Key was just pressed - find initial target
         IsAiming = true
@@ -685,7 +1017,7 @@ RunService.RenderStepped:Connect(function()
     
     -- Update ESP for all tracked characters
     for model, data in pairs(TrackedCharacters) do
-        if model.Parent and isPlayerModel(model) and isInTargetContainer(model) then
+        if model and model.Parent and isPlayerModel(model) and isInTargetContainer(model) then
             local torsoPart = model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
             local head = model:FindFirstChild("Head")
             
@@ -717,7 +1049,7 @@ RunService.RenderStepped:Connect(function()
                         data.Line.Visible = false
                     end
                     
-                    -- NEW: Distance Text
+                    -- Distance Text
                     if Settings.ESPEnabled and Settings.ESPDistance then
                         -- Calculate distance from local player
                         local localChar = LocalPlayer.Character
@@ -805,6 +1137,35 @@ RunService.RenderStepped:Connect(function()
         LockIndicator.Visible = false
     end
     
+    -- Handle triggerbot logic - WITH FIXED RAYCAST CHECK
+    if Settings.TriggerbotEnabled and IsTriggerbotActive then
+        -- Check if enough time has passed since last shot
+        if currentTime - lastTriggerTime >= triggerCooldown then
+            -- Find target for triggerbot (with raycast check)
+            local triggerTarget = findTriggerbotTarget()
+            
+            if triggerTarget and triggerTarget.HasLineOfSight then
+                -- Show triggerbot indicator (green for clear line of sight to target part)
+                TriggerbotIndicator.Visible = true
+                TriggerbotIndicator.Position = triggerTarget.ScreenPosition
+                TriggerbotIndicator.Color = Color3.fromRGB(0, 255, 0) -- Green for clear line of sight
+                
+                -- Use your exploit's built-in mouse1click function
+                mouse1click()
+                lastTriggerTime = currentTime
+            elseif triggerTarget and not triggerTarget.HasLineOfSight then
+                -- Show indicator but don't shoot (red for blocked or hitting wrong body part)
+                TriggerbotIndicator.Visible = true
+                TriggerbotIndicator.Position = triggerTarget.ScreenPosition
+                TriggerbotIndicator.Color = Color3.fromRGB(255, 0, 0) -- Red for blocked
+            else
+                TriggerbotIndicator.Visible = false
+            end
+        end
+    else
+        TriggerbotIndicator.Visible = false
+    end
+    
     -- Back warning
     local showWarning = false
     if Settings.BackWarning then
@@ -828,6 +1189,27 @@ end)
 -- Initial notification
 Rayfield:Notify({
     Title = "Komaru", 
-    Content = "Third-Person Mouse Aimbot Loaded - Use 'Screen Center as Origin' for better results", 
-    Duration = 4
+    Content = "Third-Person Mouse Aimbot & Triggerbot Loaded\nTriggerbot with Smart Raycast: Will only shoot when aiming at selected body part\nHold T to auto-shoot when clear line of sight to target part", 
+    Duration = 5
 })
+
+game.Lighting.FogEnd = 100000
+game.Lighting.FogStart = 0
+game.Lighting.ClockTime = 14
+game.Lighting.Brightness = 2
+game.Lighting.GlobalShadows = false
+local Light = game:GetService("Lighting")
+
+function dofullbright()
+Light.Ambient = Color3.new(1, 1, 1)
+Light.ColorShift_Bottom = Color3.new(1, 1, 1)
+Light.ColorShift_Top = Color3.new(1, 1, 1)
+end
+
+dofullbright()
+
+Light.LightingChanged:Connect(dofullbright)
+
+pcall(function()
+game.Lighting.Atmosphere:Destroy()
+end)
