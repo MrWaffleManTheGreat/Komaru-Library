@@ -11,6 +11,9 @@ local LocalPlayer = Players.LocalPlayer
 -- Character tracking system
 local TrackedCharacters = {}
 
+-- Store previous positions for velocity calculation
+local PreviousPositions = {}
+
 -- Aimbot state
 local LockedTarget = nil
 local IsAiming = false
@@ -34,6 +37,10 @@ local Settings = {
     ShowFOV = true,
     FOVColor = Color3.fromRGB(255, 0, 0),
     FOVThickness = 1,
+    
+    -- Prediction
+    PredictionEnabled = false,
+    PredictionIntensity = 1.0, -- Multiplier for prediction (1.0 = normal, higher = more aggressive)
     
     -- Triggerbot
     TriggerbotEnabled = false,
@@ -351,6 +358,66 @@ local function smoothMoveMouseTo(targetPos)
     end
 end
 
+-- Calculate target velocity and predict position
+local function calculatePredictedPosition(model, targetPart)
+    if not model or not targetPart then return nil end
+    
+    local currentTime = tick()
+    local currentPos = targetPart.Position
+    
+    -- Get previous position data
+    if not PreviousPositions[model] then
+        PreviousPositions[model] = {
+            position = currentPos,
+            time = currentTime,
+            velocity = Vector3.new(0, 0, 0)
+        }
+        return nil -- Need at least one frame to calculate velocity
+    end
+    
+    local prevData = PreviousPositions[model]
+    
+    -- Calculate time difference
+    local deltaTime = currentTime - prevData.time
+    
+    if deltaTime > 0 then
+        -- Calculate current velocity
+        local velocity = (currentPos - prevData.position) / deltaTime
+        
+        -- Smooth velocity (optional, reduces jitter)
+        local smoothedVelocity = (prevData.velocity * 0.3 + velocity * 0.7)
+        
+        -- Calculate distance from camera to target
+        local cameraPos = Camera.CFrame.Position
+        local distance = (cameraPos - currentPos).Magnitude
+        
+        -- Calculate bullet travel time (assuming instant hit, adjust if needed)
+        -- For projectile weapons, you'd need to know the bullet speed
+        local travelTime = 0.1 -- Adjust this based on your game's mechanics
+        
+        -- Calculate prediction offset based on velocity, distance, and intensity
+        local predictionOffset = smoothedVelocity * travelTime * Settings.PredictionIntensity
+        
+        -- Adjust prediction based on distance (closer targets need less prediction)
+        local distanceFactor = math.clamp(distance / 500, 0.5, 2.0) -- Normalize distance factor
+        predictionOffset = predictionOffset * distanceFactor
+        
+        -- Update previous position data
+        prevData.position = currentPos
+        prevData.time = currentTime
+        prevData.velocity = smoothedVelocity
+        
+        -- Return predicted position
+        return currentPos + predictionOffset
+    end
+    
+    -- Update position anyway
+    prevData.position = currentPos
+    prevData.time = currentTime
+    
+    return nil
+end
+
 -- Find initial target when first pressing aimbot key
 local function findInitialTarget()
     if not Settings.AimbotEnabled then return nil end
@@ -369,7 +436,16 @@ local function findInitialTarget()
         if model and model.Parent and isPlayerModel(model) and isInTargetContainer(model) then
             local targetPart = getTargetPart(model)
             if targetPart then
-                local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                -- Calculate predicted position if prediction is enabled
+                local targetPosition = targetPart.Position
+                if Settings.PredictionEnabled then
+                    local predictedPos = calculatePredictedPosition(model, targetPart)
+                    if predictedPos then
+                        targetPosition = predictedPos
+                    end
+                end
+                
+                local partPos, onScreen = Camera:WorldToViewportPoint(targetPosition)
                 if onScreen then
                     local screenPos = Vector2.new(partPos.X, partPos.Y)
                     local distance = (screenPos - mousePos).Magnitude
@@ -378,6 +454,7 @@ local function findInitialTarget()
                         bestTarget = {
                             Model = model,
                             Part = targetPart,
+                            Position = targetPosition,
                             ScreenPosition = screenPos,
                             Distance = distance
                         }
@@ -541,7 +618,16 @@ local function findTriggerbotTarget()
                     )
                     
                     if distance <= Settings.TriggerbotRange then
-                        local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                        -- Calculate predicted position if prediction is enabled
+                        local targetPosition = targetPart.Position
+                        if Settings.PredictionEnabled then
+                            local predictedPos = calculatePredictedPosition(model, targetPart)
+                            if predictedPos then
+                                targetPosition = predictedPos
+                            end
+                        end
+                        
+                        local partPos, onScreen = Camera:WorldToViewportPoint(targetPosition)
                         if onScreen then
                             local screenPos = Vector2.new(partPos.X, partPos.Y)
                             local screenDistance = (screenPos - mousePos).Magnitude
@@ -556,6 +642,7 @@ local function findTriggerbotTarget()
                                         bestTarget = {
                                             Model = model,
                                             Part = targetPart,
+                                            Position = targetPosition,
                                             ScreenPosition = screenPos,
                                             Distance = distance,
                                             ScreenDistance = screenDistance,
@@ -567,6 +654,7 @@ local function findTriggerbotTarget()
                                         bestTarget = {
                                             Model = model,
                                             Part = targetPart,
+                                            Position = targetPosition,
                                             ScreenPosition = screenPos,
                                             Distance = distance,
                                             ScreenDistance = screenDistance,
@@ -579,6 +667,7 @@ local function findTriggerbotTarget()
                                     bestTarget = {
                                         Model = model,
                                         Part = targetPart,
+                                        Position = targetPosition,
                                         ScreenPosition = screenPos,
                                         Distance = distance,
                                         ScreenDistance = screenDistance,
@@ -608,6 +697,37 @@ local Window = Rayfield:CreateWindow({
 
 local AimTab = Window:CreateTab("Combat (Aim)", 4483362458)
 local VisTab = Window:CreateTab("Visuals (ESP)", 4483345998)
+
+-- --- PREDICTION SEKTION ---
+AimTab:CreateSection("Prediction Settings")
+
+AimTab:CreateToggle({
+   Name = "Prediction",
+   CurrentValue = false,
+   Callback = function(v) 
+        Settings.PredictionEnabled = v 
+        if v then
+            Rayfield:Notify({
+                Title = "Prediction",
+                Content = "Prediction enabled: Will lead moving targets based on velocity and distance",
+                Duration = 3
+            })
+        else
+            -- Clear previous positions when disabling prediction
+            PreviousPositions = {}
+        end
+   end
+})
+
+AimTab:CreateSlider({
+   Name = "Prediction Intensity",
+   Range = {0.1, 3.0},
+   Increment = 0.1,
+   CurrentValue = 1.0,
+   Callback = function(v) 
+        Settings.PredictionIntensity = v 
+   end
+})
 
 -- --- TRIGGERBOT SEKTION ---
 AimTab:CreateSection("Triggerbot Settings")
@@ -734,6 +854,7 @@ AimTab:CreateDropdown({
         Settings.AimbotPart = v 
         LockedTarget = nil
         HasTargetLock = false
+        PreviousPositions = {} -- Clear prediction data when changing target part
    end
 })
 
@@ -796,6 +917,7 @@ AimTab:CreateToggle({
         TrackedCharacters = {}
         LockedTarget = nil
         HasTargetLock = false
+        PreviousPositions = {} -- Clear prediction data
    end
 })
 
@@ -813,6 +935,7 @@ AimTab:CreateToggle({
         TrackedCharacters = {}
         LockedTarget = nil
         HasTargetLock = false
+        PreviousPositions = {} -- Clear prediction data
    end
 })
 
@@ -830,6 +953,7 @@ AimTab:CreateToggle({
         TrackedCharacters = {}
         LockedTarget = nil
         HasTargetLock = false
+        PreviousPositions = {} -- Clear prediction data
    end
 })
 
@@ -927,6 +1051,7 @@ VisTab:CreateToggle({
             if data.DistanceText then data.DistanceText:Remove() end
         end
         TrackedCharacters = {}
+        PreviousPositions = {} -- Clear prediction data
    end
 })
 
@@ -942,6 +1067,7 @@ VisTab:CreateToggle({
             if data.DistanceText then data.DistanceText:Remove() end
         end
         TrackedCharacters = {}
+        PreviousPositions = {} -- Clear prediction data
    end
 })
 
@@ -957,6 +1083,7 @@ VisTab:CreateToggle({
             if data.DistanceText then data.DistanceText:Remove() end
         end
         TrackedCharacters = {}
+        PreviousPositions = {} -- Clear prediction data
    end
 })
 
@@ -1093,7 +1220,17 @@ RunService.RenderStepped:Connect(function()
             if isLockedTargetValid() then
                 local targetPart = getTargetPart(LockedTarget.Model)
                 if targetPart then
-                    local partPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+                    -- Calculate predicted position if prediction is enabled
+                    local targetPosition = targetPart.Position
+                    if Settings.PredictionEnabled then
+                        local predictedPos = calculatePredictedPosition(LockedTarget.Model, targetPart)
+                        if predictedPos then
+                            targetPosition = predictedPos
+                            LockedTarget.Position = targetPosition
+                        end
+                    end
+                    
+                    local partPos, onScreen = Camera:WorldToViewportPoint(targetPosition)
                     if onScreen then
                         LockedTarget.ScreenPosition = Vector2.new(partPos.X, partPos.Y)
                         smoothMoveMouseTo(LockedTarget.ScreenPosition)
@@ -1101,6 +1238,13 @@ RunService.RenderStepped:Connect(function()
                         -- Show lock indicator
                         LockIndicator.Visible = true
                         LockIndicator.Position = LockedTarget.ScreenPosition
+                        
+                        -- If prediction is enabled, show prediction indicator (change color)
+                        if Settings.PredictionEnabled then
+                            LockIndicator.Color = Color3.fromRGB(255, 165, 0) -- Orange for predicted aim
+                        else
+                            LockIndicator.Color = Color3.fromRGB(0, 255, 0) -- Green for normal aim
+                        end
                     else
                         -- Target went off screen but we keep lock (won't switch)
                         LockIndicator.Visible = false
@@ -1128,6 +1272,13 @@ RunService.RenderStepped:Connect(function()
                 smoothMoveMouseTo(LockedTarget.ScreenPosition)
                 LockIndicator.Visible = true
                 LockIndicator.Position = LockedTarget.ScreenPosition
+                
+                -- If prediction is enabled, show prediction indicator
+                if Settings.PredictionEnabled then
+                    LockIndicator.Color = Color3.fromRGB(255, 165, 0) -- Orange for predicted aim
+                else
+                    LockIndicator.Color = Color3.fromRGB(0, 255, 0) -- Green for normal aim
+                end
             else
                 LockIndicator.Visible = false
             end
@@ -1148,7 +1299,13 @@ RunService.RenderStepped:Connect(function()
                 -- Show triggerbot indicator (green for clear line of sight to target part)
                 TriggerbotIndicator.Visible = true
                 TriggerbotIndicator.Position = triggerTarget.ScreenPosition
-                TriggerbotIndicator.Color = Color3.fromRGB(0, 255, 0) -- Green for clear line of sight
+                
+                -- If prediction is enabled, show blue indicator
+                if Settings.PredictionEnabled then
+                    TriggerbotIndicator.Color = Color3.fromRGB(0, 255, 255) -- Cyan for predicted triggerbot
+                else
+                    TriggerbotIndicator.Color = Color3.fromRGB(0, 255, 0) -- Green for clear line of sight
+                end
                 
                 -- Use your exploit's built-in mouse1click function
                 mouse1click()
@@ -1189,7 +1346,7 @@ end)
 -- Initial notification
 Rayfield:Notify({
     Title = "Komaru", 
-    Content = "Third-Person Mouse Aimbot & Triggerbot Loaded\nTriggerbot with Smart Raycast: Will only shoot when aiming at selected body part\nHold T to auto-shoot when clear line of sight to target part", 
+    Content = "Third-Person Mouse Aimbot & Triggerbot Loaded\nPrediction System: Tracks target velocity and adjusts aim for moving targets\nTriggerbot with Smart Raycast: Will only shoot when aiming at selected body part\nHold T to auto-shoot when clear line of sight to target part", 
     Duration = 5
 })
 
